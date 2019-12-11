@@ -11,14 +11,7 @@ import time
 import tensorflow as tf
 
 modelBucketName = os.environ.get('MODEL_BUCKET_NAME', os.path.dirname(os.path.abspath(__file__)))
-modelPrimaryFilename = os.environ.get('MODEL_PRIMARY_FILENAME', os.path.dirname(os.path.abspath(__file__)))
-modelPrimaryLoadPath =  os.path.join(os.sep, 'tmp', 'model_primary.pb')
-modelSecondaryFilename = os.environ.get('MODEL_SECONDARY_FILENAME', os.path.dirname(os.path.abspath(__file__)))
-modelSecondaryLoadPath =  os.path.join(os.sep, 'tmp', 'model_secondary.pb')
-labelsPrimaryFilename = os.environ.get('LABELS_PRIMARY_FILENAME', os.path.dirname(os.path.abspath(__file__)))
-labelsPrimaryLoadPath =  os.path.join(os.sep, 'tmp', 'labels_primary.txt')
-labelsSecondaryFilename = os.environ.get('LABELS_SECONDARY_FILENAME', os.path.dirname(os.path.abspath(__file__)))
-labelsSecondaryLoadPath =  os.path.join(os.sep, 'tmp', 'labels_secondary.txt')
+modelDirectoryName = os.environ.get('MODEL_DIRECTORY_NAME', os.path.dirname(os.path.abspath(__file__)))
 inputHeight = int(os.environ.get('INPUT_HEIGHT', os.path.dirname(os.path.abspath(__file__))))
 inputWidth = int(os.environ.get('INPUT_WIDTH', os.path.dirname(os.path.abspath(__file__))))
 inputMean = int(os.environ.get('INPUT_MEAN', os.path.dirname(os.path.abspath(__file__))))
@@ -46,52 +39,40 @@ def loadLabels(labelFile):
 	return label
 
 #Tensorflow model gets loaded into memory only on container startup
-print('Downloading Model from S3...')
+print('Downloading Models from S3...')
 s3 = boto3.resource('s3')
-s3.Bucket(modelBucketName).download_file(modelPrimaryFilename, modelPrimaryLoadPath)
-s3.Bucket(modelBucketName).download_file(labelsPrimaryFilename, labelsPrimaryLoadPath)
-s3.Bucket(modelBucketName).download_file(modelSecondaryFilename, modelSecondaryLoadPath)
-s3.Bucket(modelBucketName).download_file(labelsSecondaryFilename, labelsSecondaryLoadPath)
+bucket = s3.Bucket(modelBucketName);
 
-primaryModel = loadGraph(modelPrimaryLoadPath)
-primaryLabels = loadLabels(labelsPrimaryLoadPath)
-secondaryModel = loadGraph(modelSecondaryLoadPath)
-secondaryLabels = loadLabels(labelsSecondaryLoadPath)
-    
+labels = {}
+models = {}
+for file in bucket.objects.all():
+	if file.key.startswith(modelDirectoryName + 'graph_') and file.key.endswith('.pb'):
+		model = file.key.replace(modelDirectoryName + 'graph_', '').replace('.pb', '')
+		loadPath = os.path.join(os.sep, 'tmp', 'graph_' + model + '.pb')
+		bucket.download_file(file.key, loadPath)
+		models[model] = loadGraph(loadPath)
+		os.remove(loadPath)
+	if file.key.startswith(modelDirectoryName + 'labels_') and file.key.endswith('.txt'):
+		model = file.key.replace(modelDirectoryName + 'labels_', '').replace('.txt', '')
+		loadPath = os.path.join(os.sep, 'tmp', 'labels_' + model + '.pb')
+		bucket.download_file(file.key, loadPath)
+		labels[model] = loadLabels(loadPath)
+		os.remove(loadPath)
+
 def lambda_handler(event, context):
-	#api handling
-	if 'queryStringParameters' in event:
-		queryStringParameters = event['queryStringParameters']
-		url = queryStringParameters['url']
-		path = '/tmp/{}'.format(uuid.uuid4())
-		with open(path,'wb') as f:
-			f.write(urllib2.urlopen(url).read())
-			f.close()
-	
-		data = {
-			"categories": imageClassification(path),
-		}
-	
-		return {
-			"statusCode": 200,
-			"body": json.dumps(data)
-		}
+	if 'ping' in event.keys():
+		print('Lambda warmed')
+		return {}
 	else:
-	#s3 event
 		client = boto3.client('s3')
-		bucket = event['Records'][0]['s3']['bucket']['name']
-		key = event['Records'][0]['s3']['object']['key']
+		bucket = event['bucket']
+		key = event['key']
+		model = event['model']
 		path = '/tmp/{}'.format(uuid.uuid4())
 		client.download_file(bucket, key, path)
-		obj = client.get_object(Bucket=bucket, Key=key)
-		meta = obj["Metadata"]
-		if 'categories' not in meta:
-			meta['categories'] = json.dumps(imageClassification(path));
-			client.copy_object(Bucket = bucket, Key = key, CopySource = bucket + '/' + key, Metadata = meta, MetadataDirective='REPLACE')
-			print('Successfully saved meta data on image')
-		else:
-			print('Image was previously processed')
-			
+
+		return makePredictions(path, models[model], labels[model])
+				
 def makePredictions(fileName, model, labels):
 	t = readTensorFromImageFile(fileName, inputHeight = inputHeight, inputWidth = inputWidth, inputMean = inputMean, inputStd = inputStd)
 	
@@ -111,25 +92,11 @@ def makePredictions(fileName, model, labels):
 	predictions = {}
 	for i in top:
 		if results[i] >= minScore:
-			predictions[labels[i].replace(' ', '-')] = round(results[i] * 100, 2);
-      			
+			predictions[labels[i].replace(' ', '-')] = round(results[i] * 100, 2)
+					
 	return predictions
 				
-def imageClassification(fileName):
-	primaryPredictions = makePredictions(fileName, primaryModel, primaryLabels)
-	
-	if len(primaryPredictions) == 0:
-		print('No predictions above the min score specified for primary model.')
-		
-	secondaryPredictions = makePredictions(fileName, secondaryModel, secondaryLabels)	
-	if len(secondaryPredictions) == 0:
-		print('No predictions above the min score specified for secondary model.')
-		
-	predictions = primaryPredictions
-	predictions.update(secondaryPredictions)
-			
-	return predictions
-		
+
 def readTensorFromImageFile(fileName, inputHeight=299, inputWidth=299, inputMean=0, inputStd=255):
 	inputName = "file_reader"
 	outputName = "normalized"
